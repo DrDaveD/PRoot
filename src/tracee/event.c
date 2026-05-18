@@ -312,11 +312,11 @@ static bool eval_location(unsigned long fp,
 		return true;
 	}
 
-	/* DW_OP_bregN (0x77..0x96): register N + signed LEB128 offset */
-	if (op->atom >= 0x77 && op->atom <= 0x96) {
+	/* DW_OP_bregN (DW_OP_breg0..DW_OP_breg31): register N + signed LEB128 offset */
+	if (op->atom >= DW_OP_breg0 && op->atom <= DW_OP_breg0 + 31) {
 		if (regs == NULL)
 			return false;
-		unsigned int regnum = op->atom - 0x77;
+		unsigned int regnum = op->atom - DW_OP_breg0;
 		unsigned long base  = DWARF_REG_TO_PTRACE(regnum, regs);
 		*addr_out = base + (unsigned long)(long) op->number;
 		return true;
@@ -380,7 +380,10 @@ static void format_value(pid_t pid, unsigned long val, bool is_addr,
 					}
 					str[i] = '\0';
 					if (ok && i > 0) {
-						char tmp[64 + 4 + sizeof(str) + 3];
+						/* Buffer: max 16 hex digits for
+						 * address + ' "' + str + '"' or
+						 * '"..."' + NUL */
+						char tmp[18 + sizeof(str) + 5];
 						snprintf(tmp, sizeof(tmp),
 							"0x%lx \"%s%s\"",
 							val, str,
