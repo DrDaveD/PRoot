@@ -51,6 +51,11 @@
 #include "attribute.h"
 #include "compat.h"
 
+#ifdef HAVE_LIBDW
+#include <elfutils/libdwfl.h>
+#include <dwarf.h>
+#endif
+
 #if defined(ARCH_ARM64)
 #include <linux/elf.h>  /* NT_PRSTATUS */
 #endif
@@ -124,6 +129,485 @@ static int peek_tracee_word(pid_t pid, unsigned long address,
 	return 0;
 }
 
+#ifdef HAVE_LIBDW
+
+/* DWARF x86_64 register numbers for parameter-passing registers */
+#if defined(ARCH_X86_64)
+#define DWARF_REG_TO_PTRACE(n, regs) dwarf_x86_64_reg(n, regs)
+static unsigned long dwarf_x86_64_reg(unsigned int regnum,
+					const struct user_regs_struct *regs)
+{
+	switch (regnum) {
+	case  0: return (unsigned long) regs->rax;
+	case  1: return (unsigned long) regs->rdx;
+	case  2: return (unsigned long) regs->rcx;
+	case  3: return (unsigned long) regs->rbx;
+	case  4: return (unsigned long) regs->rsi;
+	case  5: return (unsigned long) regs->rdi;
+	case  6: return (unsigned long) regs->rbp;
+	case  7: return (unsigned long) regs->rsp;
+	case  8: return (unsigned long) regs->r8;
+	case  9: return (unsigned long) regs->r9;
+	case 10: return (unsigned long) regs->r10;
+	case 11: return (unsigned long) regs->r11;
+	case 12: return (unsigned long) regs->r12;
+	case 13: return (unsigned long) regs->r13;
+	case 14: return (unsigned long) regs->r14;
+	case 15: return (unsigned long) regs->r15;
+	default: return 0;
+	}
+}
+#elif defined(ARCH_X86)
+#define DWARF_REG_TO_PTRACE(n, regs) dwarf_x86_reg(n, regs)
+static unsigned long dwarf_x86_reg(unsigned int regnum,
+				const struct user_regs_struct *regs)
+{
+	switch (regnum) {
+	case 0: return (unsigned long) regs->eax;
+	case 1: return (unsigned long) regs->ecx;
+	case 2: return (unsigned long) regs->edx;
+	case 3: return (unsigned long) regs->ebx;
+	case 4: return (unsigned long) regs->esp;
+	case 5: return (unsigned long) regs->ebp;
+	case 6: return (unsigned long) regs->esi;
+	case 7: return (unsigned long) regs->edi;
+	default: return 0;
+	}
+}
+#elif defined(ARCH_ARM_EABI)
+#define DWARF_REG_TO_PTRACE(n, regs) ((unsigned long)(regs)->uregs[(n) < 16 ? (n) : 0])
+#elif defined(ARCH_ARM64)
+#define DWARF_REG_TO_PTRACE(n, regs) ((unsigned long)(regs)->regs[(n) < 31 ? (n) : 0])
+#else
+#define DWARF_REG_TO_PTRACE(n, regs) ((void)(n), (void)(regs), 0UL)
+#endif
+
+/*
+ * Number of bytes added to the frame pointer to get the CFA
+ * (Canonical Frame Address) for a function with a standard prologue.
+ * CFA is the stack pointer value at the call instruction.
+ */
+#if defined(ARCH_X86_64) || defined(ARCH_ARM64)
+#define CFA_FP_OFFSET 16UL
+#elif defined(ARCH_X86)
+#define CFA_FP_OFFSET 8UL
+#elif defined(ARCH_ARM_EABI)
+/* ARM EABI frame: FP points to [saved_PC, saved_SP, saved_LR, saved_FP] at -4/-8/-12 */
+#define CFA_FP_OFFSET 0UL
+#else
+#define CFA_FP_OFFSET 0UL
+#endif
+
+/**
+ * Resolve a DWARF type DIE to its underlying base type, skipping
+ * typedef / const / volatile / restrict wrappers.
+ * Returns false if the type could not be resolved.
+ */
+static bool resolve_type(Dwarf_Die *type_die, Dwarf_Die *result)
+{
+	Dwarf_Die tmp = *type_die;
+	int depth = 0;
+
+	while (depth++ < 16) {
+		int tag = dwarf_tag(&tmp);
+
+		if (tag == DW_TAG_base_type || tag == DW_TAG_pointer_type ||
+		    tag == DW_TAG_enumeration_type)
+			break;
+
+		if (tag == DW_TAG_typedef || tag == DW_TAG_const_type ||
+		    tag == DW_TAG_volatile_type ||
+		    tag == DW_TAG_restrict_type) {
+			Dwarf_Attribute attr;
+			Dwarf_Die next;
+
+			if (dwarf_attr(&tmp, DW_AT_type, &attr) == NULL)
+				return false;
+			if (dwarf_formref_die(&attr, &next) == NULL)
+				return false;
+			tmp = next;
+		} else {
+			break;
+		}
+	}
+
+	*result = tmp;
+	return true;
+}
+
+/**
+ * Read a value of @byte_size bytes from the tracee's memory or
+ * a register and store it as an unsigned long.
+ */
+static bool read_value(pid_t pid, unsigned long addr, unsigned int byte_size,
+			unsigned long *out)
+{
+	unsigned long word = 0;
+	unsigned int i;
+	uint8_t bytes[8];
+
+	if (byte_size > sizeof(bytes))
+		byte_size = sizeof(bytes);
+
+	for (i = 0; i < byte_size; i += sizeof(unsigned long)) {
+		unsigned long w;
+		if (peek_tracee_word(pid, addr + i, &w) < 0)
+			return false;
+		memcpy(&bytes[i], &w,
+			(byte_size - i < sizeof(unsigned long))
+			? (byte_size - i) : sizeof(unsigned long));
+	}
+
+	word = 0;
+	memcpy(&word, bytes, byte_size);
+	*out = word;
+	return true;
+}
+
+/**
+ * Evaluate a simple DWARF location expression for a parameter.
+ * @fp        frame pointer for the frame containing the parameter
+ * @regs      register values (only valid for frame 0, may be NULL for others)
+ * @expr      the location expression
+ * @exprlen   length of the expression
+ * @addr_out  the computed address (for memory-based locations)
+ * @reg_val   the register value (for register-based locations)
+ * @is_reg    set to true if the result is a register value, not an address
+ *
+ * Returns true on success.
+ */
+static bool eval_location(unsigned long fp,
+			const struct user_regs_struct *regs,
+			const Dwarf_Op *expr, size_t exprlen,
+			unsigned long *addr_out, unsigned long *reg_val,
+			bool *is_reg)
+{
+	const Dwarf_Op *op;
+	unsigned long cfa;
+
+	if (exprlen == 0)
+		return false;
+
+	op = &expr[0];
+	*is_reg = false;
+	cfa = fp + CFA_FP_OFFSET;
+
+	switch (op->atom) {
+	case DW_OP_fbreg:
+		/* frame_base + signed offset; assume frame_base = CFA */
+		*addr_out = cfa + (unsigned long)(long) op->number;
+		return true;
+
+	case DW_OP_addr:
+		*addr_out = (unsigned long) op->number;
+		return true;
+	}
+
+	/* DW_OP_reg0..DW_OP_reg31: value is in a register */
+	if (op->atom >= DW_OP_reg0 && op->atom <= DW_OP_reg31) {
+		if (regs == NULL)
+			return false;
+		*reg_val = DWARF_REG_TO_PTRACE(op->atom - DW_OP_reg0, regs);
+		*is_reg  = true;
+		return true;
+	}
+
+	/* DW_OP_bregN (0x77..0x96): register N + signed LEB128 offset */
+	if (op->atom >= 0x77 && op->atom <= 0x96) {
+		if (regs == NULL)
+			return false;
+		unsigned int regnum = op->atom - 0x77;
+		unsigned long base  = DWARF_REG_TO_PTRACE(regnum, regs);
+		*addr_out = base + (unsigned long)(long) op->number;
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * Format a value of the given DWARF type into @buf.
+ */
+static void format_value(pid_t pid, unsigned long val, bool is_addr,
+			Dwarf_Die *type_die, char *buf, size_t buf_size)
+{
+	Dwarf_Die base;
+	int tag;
+	Dwarf_Word byte_size = 0;
+	Dwarf_Attribute attr;
+
+	if (!resolve_type(type_die, &base)) {
+		snprintf(buf, buf_size, "0x%lx", val);
+		return;
+	}
+
+	tag = dwarf_tag(&base);
+
+	if (tag == DW_TAG_pointer_type) {
+		/* For char pointers, try to print as string */
+		Dwarf_Attribute type_attr;
+		Dwarf_Die pointee;
+
+		snprintf(buf, buf_size, "0x%lx", val);
+
+		if (val != 0 &&
+		    dwarf_attr(&base, DW_AT_type, &type_attr) != NULL &&
+		    dwarf_formref_die(&type_attr, &pointee) != NULL) {
+			Dwarf_Die pointee_base;
+			if (resolve_type(&pointee, &pointee_base) &&
+			    dwarf_tag(&pointee_base) == DW_TAG_base_type) {
+				Dwarf_Word enc = 0;
+				Dwarf_Attribute enc_attr;
+				if (dwarf_attr(&pointee_base, DW_AT_encoding,
+						&enc_attr) != NULL)
+					dwarf_formudata(&enc_attr, &enc);
+				if (enc == DW_ATE_signed_char ||
+				    enc == DW_ATE_unsigned_char) {
+					/* Read up to 32 bytes of string */
+					char str[33];
+					unsigned int i;
+					bool ok = true;
+					for (i = 0; i < sizeof(str) - 1; i++) {
+						unsigned long b = 0;
+						if (!read_value(pid, val + i,
+								1, &b)) {
+							ok = false;
+							break;
+						}
+						if (b == 0)
+							break;
+						str[i] = (char) b;
+					}
+					str[i] = '\0';
+					if (ok && i > 0) {
+						char tmp[64 + 4 + sizeof(str) + 3];
+						snprintf(tmp, sizeof(tmp),
+							"0x%lx \"%s%s\"",
+							val, str,
+							i == sizeof(str) - 1
+							? "..." : "");
+						snprintf(buf, buf_size, "%s",
+							tmp);
+					}
+				}
+			}
+		}
+		return;
+	}
+
+	if (tag == DW_TAG_base_type) {
+		Dwarf_Word enc = 0;
+
+		if (dwarf_attr(&base, DW_AT_byte_size, &attr) != NULL)
+			dwarf_formudata(&attr, &byte_size);
+		if (dwarf_attr(&base, DW_AT_encoding, &attr) != NULL)
+			dwarf_formudata(&attr, &enc);
+
+		/* Sign-extend if needed */
+		if (enc == DW_ATE_signed && byte_size > 0 &&
+		    byte_size < sizeof(unsigned long)) {
+			unsigned int shift = (unsigned int)
+					(8 * (sizeof(unsigned long) - byte_size));
+			long sval = ((long)(val << shift)) >> shift;
+			snprintf(buf, buf_size, "%ld", sval);
+		} else if (enc == DW_ATE_signed) {
+			snprintf(buf, buf_size, "%ld", (long) val);
+		} else if (enc == DW_ATE_boolean) {
+			snprintf(buf, buf_size, "%s", val ? "true" : "false");
+		} else {
+			snprintf(buf, buf_size, "%lu", val);
+		}
+		return;
+	}
+
+	if (tag == DW_TAG_enumeration_type) {
+		/* Find the enumerator whose value matches */
+		Dwarf_Die child;
+		if (dwarf_child(&base, &child) == 0) {
+			do {
+				if (dwarf_tag(&child) != DW_TAG_enumerator)
+					continue;
+				Dwarf_Attribute cval_attr;
+				Dwarf_Word cval = 0;
+				if (dwarf_attr(&child, DW_AT_const_value,
+						&cval_attr) != NULL &&
+				    dwarf_formudata(&cval_attr, &cval) == 0 &&
+				    cval == val) {
+					Dwarf_Attribute name_attr;
+					const char *name;
+					if (dwarf_attr(&child, DW_AT_name,
+							&name_attr) != NULL &&
+					    (name = dwarf_formstring(
+							&name_attr)) != NULL) {
+						snprintf(buf, buf_size,
+							"%s (%lu)", name, val);
+						return;
+					}
+				}
+			} while (dwarf_siblingof(&child, &child) == 0);
+		}
+		snprintf(buf, buf_size, "%lu", val);
+		return;
+	}
+
+	(void) is_addr;
+	snprintf(buf, buf_size, "0x%lx", val);
+}
+
+/**
+ * Print all formal parameters for a function at @pc with the given
+ * frame pointer @fp.  @regs is the full register set for frame 0
+ * (may be NULL for other frames).
+ */
+static void print_frame_params(const Tracee *tracee, Dwfl_Module *mod,
+				Dwarf_Addr pc, unsigned long fp,
+				const struct user_regs_struct *regs,
+				Dwarf_Addr bias)
+{
+	Dwarf_Die *scopes = NULL;
+	Dwarf_Die *cudie;
+	int nscopes, i;
+	bool first = true;
+	char line_buf[512];
+	int pos = 0;
+
+	cudie = dwfl_module_addrdie(mod, pc, &bias);
+	if (cudie == NULL)
+		return;
+
+	/* Get the scope chain at this PC (relative to the CU bias) */
+	nscopes = dwarf_getscopes(cudie, pc - bias, &scopes);
+	if (nscopes <= 0)
+		return;
+
+	/* scopes[0] is the innermost scope; find the DW_TAG_subprogram */
+	for (i = 0; i < nscopes; i++) {
+		Dwarf_Die child;
+
+		if (dwarf_tag(&scopes[i]) != DW_TAG_subprogram)
+			continue;
+
+		/* Iterate children looking for formal parameters */
+		if (dwarf_child(&scopes[i], &child) != 0)
+			break;
+
+		do {
+			Dwarf_Attribute name_attr, loc_attr, type_attr;
+			const char *pname;
+			Dwarf_Op *expr;
+			size_t exprlen;
+			Dwarf_Die type_die;
+			unsigned long addr_val = 0, reg_val = 0;
+			bool is_reg = false;
+			char val_buf[128];
+
+			if (dwarf_tag(&child) != DW_TAG_formal_parameter)
+				continue;
+
+			if (dwarf_attr(&child, DW_AT_name, &name_attr) == NULL)
+				continue;
+			pname = dwarf_formstring(&name_attr);
+			if (pname == NULL)
+				continue;
+
+			/* Get the type, for formatting the value */
+			if (dwarf_attr(&child, DW_AT_type, &type_attr) == NULL
+			    || dwarf_formref_die(&type_attr, &type_die)
+				== NULL) {
+				if (!first)
+					pos += snprintf(line_buf + pos,
+						sizeof(line_buf) - pos, ", ");
+				pos += snprintf(line_buf + pos,
+					sizeof(line_buf) - pos, "%s=?",
+					pname);
+				first = false;
+				continue;
+			}
+
+			/* Evaluate the parameter's location expression */
+			if (dwarf_attr(&child, DW_AT_location,
+					&loc_attr) == NULL ||
+			    dwarf_getlocation_addr(&loc_attr,
+					(Dwarf_Addr)(pc - bias),
+					&expr, &exprlen, 1) <= 0 ||
+			    exprlen == 0 ||
+			    !eval_location(fp, regs, expr, exprlen,
+					&addr_val, &reg_val, &is_reg)) {
+				/* No location: parameter might be optimized */
+				Dwarf_Word byte_size = 0;
+				Dwarf_Attribute sz_attr;
+				Dwarf_Die base;
+				if (resolve_type(&type_die, &base) &&
+				    dwarf_attr(&base, DW_AT_byte_size,
+						&sz_attr) != NULL)
+					dwarf_formudata(&sz_attr, &byte_size);
+
+				if (!first)
+					pos += snprintf(line_buf + pos,
+						sizeof(line_buf) - pos, ", ");
+				pos += snprintf(line_buf + pos,
+					sizeof(line_buf) - pos,
+					"%s=<optimized out>", pname);
+				first = false;
+				continue;
+			}
+
+			/* Read the value from memory or register */
+			val_buf[0] = '\0';
+			if (is_reg) {
+				format_value(tracee->pid, reg_val, false,
+						&type_die, val_buf,
+						sizeof(val_buf));
+			} else {
+				Dwarf_Die base;
+				Dwarf_Attribute sz_attr;
+				Dwarf_Word byte_size = sizeof(unsigned long);
+				unsigned long raw_val = 0;
+
+				if (resolve_type(&type_die, &base)) {
+					if (dwarf_tag(&base) ==
+					    DW_TAG_pointer_type)
+						byte_size = sizeof(void *);
+					else if (dwarf_attr(&base,
+							DW_AT_byte_size,
+							&sz_attr) != NULL)
+						dwarf_formudata(&sz_attr,
+							&byte_size);
+				}
+
+				if (read_value(tracee->pid, addr_val,
+						(unsigned int) byte_size,
+						&raw_val))
+					format_value(tracee->pid, raw_val,
+						false, &type_die, val_buf,
+						sizeof(val_buf));
+				else
+					snprintf(val_buf, sizeof(val_buf),
+						"<unreadable>");
+			}
+
+			if (!first)
+				pos += snprintf(line_buf + pos,
+					sizeof(line_buf) - pos, ", ");
+			pos += snprintf(line_buf + pos,
+				sizeof(line_buf) - pos, "%s=%s",
+				pname, val_buf);
+			first = false;
+		} while (dwarf_siblingof(&child, &child) == 0 &&
+			(size_t) pos < sizeof(line_buf) - 4);
+
+		break;
+	}
+
+	free(scopes);
+
+	if (!first)
+		VERBOSE(tracee, 1, "vpid %" PRIu64 ":      (%s)",
+			tracee->vpid, line_buf);
+}
+
+#endif /* HAVE_LIBDW */
+
 /**
  * Print a stack trace for the given @tracee using its current register
  * state (read via ptrace).  Only printed when verbose level >= 1.
@@ -181,6 +665,171 @@ static void print_stack_trace(Tracee *tracee)
 
 	(void) sp;
 
+#ifdef HAVE_LIBDW
+	{
+	static const Dwfl_Callbacks proc_callbacks = {
+		.find_elf       = dwfl_linux_proc_find_elf,
+		.find_debuginfo = dwfl_standard_find_debuginfo,
+		.debuginfo_path = NULL,
+	};
+	Dwfl *dwfl = dwfl_begin(&proc_callbacks);
+	if (dwfl != NULL) {
+		dwfl_linux_proc_report(dwfl, tracee->pid);
+		dwfl_report_end(dwfl, NULL, NULL);
+	}
+
+	VERBOSE(tracee, 1, "vpid %" PRIu64 ": stack trace:", tracee->vpid);
+
+	/* Frame 0: the instruction pointer at the time of signal termination.  */
+	{
+		Dwfl_Module *mod0 = dwfl ? dwfl_addrmodule(dwfl, pc) : NULL;
+		const char *func0 = NULL;
+		GElf_Off func0_off = 0;
+
+		if (mod0) {
+			GElf_Sym sym;
+			func0 = dwfl_module_addrinfo(mod0, pc, &func0_off,
+						&sym, NULL, NULL, NULL);
+		}
+
+		if (func0) {
+			Dwfl_Line *ln = dwfl_module_getsrc(mod0, pc);
+			const char *src = NULL;
+			int lineno = 0, col = 0;
+			if (ln)
+				src = dwfl_lineinfo(ln, NULL, &lineno, &col,
+						NULL, NULL);
+			if (src && lineno > 0)
+				VERBOSE(tracee, 1,
+					"vpid %" PRIu64
+					":  #%-2d 0x%0*lx  %s()"
+					" at %s:%d",
+					tracee->vpid, 0,
+					(int)(2 * sizeof(unsigned long)), pc,
+					func0, src, lineno);
+			else
+				VERBOSE(tracee, 1,
+					"vpid %" PRIu64
+					":  #%-2d 0x%0*lx  %s()",
+					tracee->vpid, 0,
+					(int)(2 * sizeof(unsigned long)), pc,
+					func0);
+
+			if (mod0) {
+				Dwarf_Addr bias = 0;
+				print_frame_params(tracee, mod0, (Dwarf_Addr)pc,
+						fp, &regs, bias);
+			}
+		} else {
+			VERBOSE(tracee, 1,
+				"vpid %" PRIu64 ":  #%-2d 0x%0*lx  %s",
+				tracee->vpid, 0,
+				(int)(2 * sizeof(unsigned long)), pc,
+				maps_lookup(tracee->pid, pc, info,
+						sizeof(info)));
+		}
+	}
+
+	/* Walk the frame-pointer chain to collect return addresses.  */
+	for (frame = 1; frame < STACK_TRACE_MAX_FRAMES && fp != 0; frame++) {
+		unsigned long ret_addr = 0;
+		unsigned long prev_fp  = 0;
+		int word_size;
+
+#if defined(ARCH_X86_64) || defined(ARCH_ARM64)
+		word_size = 8;
+#else
+		word_size = 4;
+#endif
+
+#if defined(ARCH_ARM_EABI)
+		if (peek_tracee_word(tracee->pid, fp - 4, &ret_addr) < 0)
+			break;
+		if (peek_tracee_word(tracee->pid, fp - 8, &prev_fp) < 0)
+			break;
+#else
+		if (peek_tracee_word(tracee->pid, fp, &prev_fp) < 0)
+			break;
+		if (peek_tracee_word(tracee->pid,
+				fp + (unsigned long) word_size,
+				&ret_addr) < 0)
+			break;
+#endif
+
+		if (ret_addr == 0)
+			break;
+
+		{
+		Dwfl_Module *mod = dwfl
+			? dwfl_addrmodule(dwfl, ret_addr) : NULL;
+		const char *func = NULL;
+		GElf_Off func_off = 0;
+
+		if (mod) {
+			GElf_Sym sym;
+			func = dwfl_module_addrinfo(mod, ret_addr, &func_off,
+						&sym, NULL, NULL, NULL);
+		}
+
+		if (func) {
+			Dwfl_Line *ln = dwfl_module_getsrc(mod, ret_addr);
+			const char *src = NULL;
+			int lineno = 0, col = 0;
+			if (ln)
+				src = dwfl_lineinfo(ln, NULL, &lineno, &col,
+						NULL, NULL);
+			if (src && lineno > 0)
+				VERBOSE(tracee, 1,
+					"vpid %" PRIu64
+					":  #%-2d 0x%0*lx  %s()"
+					" at %s:%d",
+					tracee->vpid, frame,
+					(int)(2 * sizeof(unsigned long)),
+					ret_addr, func, src, lineno);
+			else
+				VERBOSE(tracee, 1,
+					"vpid %" PRIu64
+					":  #%-2d 0x%0*lx  %s()",
+					tracee->vpid, frame,
+					(int)(2 * sizeof(unsigned long)),
+					ret_addr, func);
+
+			if (mod) {
+				Dwarf_Addr bias = 0;
+				/* The function at ret_addr belongs to the
+				 * caller's frame whose FP is prev_fp.  */
+				print_frame_params(tracee, mod,
+					(Dwarf_Addr) ret_addr, prev_fp,
+					NULL, bias);
+			}
+		} else {
+			VERBOSE(tracee, 1,
+				"vpid %" PRIu64 ":  #%-2d 0x%0*lx  %s",
+				tracee->vpid, frame,
+				(int)(2 * sizeof(unsigned long)), ret_addr,
+				maps_lookup(tracee->pid, ret_addr, info,
+						sizeof(info)));
+		}
+		}
+
+		/* Sanity check: the previous FP must be at a higher address
+		 * than the current FP (stack grows downward, so unwinding
+		 * moves toward higher addresses) and be reasonably aligned.  */
+		if (prev_fp == 0 || prev_fp == fp)
+			break;
+		if (prev_fp < fp)
+			break;
+		if (prev_fp % sizeof(unsigned long) != 0)
+			break;
+
+		fp = prev_fp;
+	}
+
+	if (dwfl)
+		dwfl_end(dwfl);
+	}
+#else  /* !HAVE_LIBDW */
+
 	VERBOSE(tracee, 1, "vpid %" PRIu64 ": stack trace:", tracee->vpid);
 
 	/* Frame 0: the instruction pointer at the time of signal termination.  */
@@ -202,16 +851,11 @@ static void print_stack_trace(Tracee *tracee)
 #endif
 
 #if defined(ARCH_ARM_EABI)
-		/* On ARM EABI the saved PC is at [FP-4] and the
-		 * previous FP is at [FP-8].  */
 		if (peek_tracee_word(tracee->pid, fp - 4, &ret_addr) < 0)
 			break;
 		if (peek_tracee_word(tracee->pid, fp - 8, &prev_fp) < 0)
 			break;
 #else
-		/* On x86/x86_64/ARM64 the layout is:
-		 *   [FP+0]          = previous FP
-		 *   [FP+word_size]  = return address   */
 		if (peek_tracee_word(tracee->pid, fp, &prev_fp) < 0)
 			break;
 		if (peek_tracee_word(tracee->pid,
@@ -226,7 +870,8 @@ static void print_stack_trace(Tracee *tracee)
 		VERBOSE(tracee, 1, "vpid %" PRIu64 ":  #%-2d 0x%0*lx  %s",
 			tracee->vpid, frame,
 			(int)(2 * sizeof(unsigned long)), ret_addr,
-			maps_lookup(tracee->pid, ret_addr, info, sizeof(info)));
+			maps_lookup(tracee->pid, ret_addr, info,
+					sizeof(info)));
 
 		/* Sanity check: the previous FP must be at a higher address
 		 * than the current FP (stack grows downward, so unwinding
@@ -240,6 +885,7 @@ static void print_stack_trace(Tracee *tracee)
 
 		fp = prev_fp;
 	}
+#endif /* HAVE_LIBDW */
 }
 
 

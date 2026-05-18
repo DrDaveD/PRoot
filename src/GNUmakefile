@@ -153,6 +153,16 @@ CHECK_PROGRAMS = $(foreach feature,$(CHECK_FEATURES),.check_$(feature))
 CHECK_OBJECTS  = $(foreach feature,$(CHECK_FEATURES),.check_$(feature).o)
 CHECK_RESULTS  = $(foreach feature,$(CHECK_FEATURES),.check_$(feature).res)
 
+LIBDW_CFLAGS  := $(shell pkg-config --cflags libdw 2>/dev/null)
+LIBDW_LDFLAGS := $(shell pkg-config --libs libdw 2>/dev/null)
+HAVE_LIBDW    := $(shell if $(CC) $(LIBDW_CFLAGS) -c $(SRC).check_libdw.c -o /dev/null 2>/dev/null && \
+			   $(LD) $(SRC).check_libdw.c $(LIBDW_LDFLAGS) -o /dev/null 2>/dev/null; \
+			 then echo yes; fi)
+ifneq ($(HAVE_LIBDW),)
+	CPPFLAGS += -DHAVE_LIBDW $(LIBDW_CFLAGS)
+	LDFLAGS  += $(LIBDW_LDFLAGS)
+endif
+
 .SILENT .IGNORE .INTERMEDIATE: $(CHECK_OBJECTS) $(CHECK_PROGRAMS)
 
 .check_%.o: .check_%.c
