@@ -183,7 +183,7 @@ static void print_stack_trace(Tracee *tracee)
 
 	VERBOSE(tracee, 1, "vpid %" PRIu64 ": stack trace:", tracee->vpid);
 
-	/* Frame 0: the instruction pointer at the time of the fault.  */
+	/* Frame 0: the instruction pointer at the time of signal termination.  */
 	VERBOSE(tracee, 1, "vpid %" PRIu64 ":  #%-2d 0x%0*lx  %s",
 		tracee->vpid, 0,
 		(int)(2 * sizeof(unsigned long)), pc,
@@ -228,9 +228,9 @@ static void print_stack_trace(Tracee *tracee)
 			(int)(2 * sizeof(unsigned long)), ret_addr,
 			maps_lookup(tracee->pid, ret_addr, info, sizeof(info)));
 
-		/* Sanity check: FP must advance (stack grows downward,
-		 * so the previous FP must be >= current FP on most
-		 * architectures) and be reasonably aligned.  */
+		/* Sanity check: the previous FP must be at a higher address
+		 * than the current FP (stack grows downward, so unwinding
+		 * moves toward higher addresses) and be reasonably aligned.  */
 		if (prev_fp == 0 || prev_fp == fp)
 			break;
 		if (prev_fp < fp)
