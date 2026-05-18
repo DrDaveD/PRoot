@@ -36,6 +36,7 @@
 #include <talloc.h>     /* talloc_*, */
 #include <inttypes.h>   /* PRI*, */
 #include <linux/version.h> /* KERNEL_VERSION, */
+#include <sys/user.h>   /* struct user_regs_struct, */
 
 #include "tracee/event.h"
 #include "cli/note.h"
@@ -49,6 +50,197 @@
 
 #include "attribute.h"
 #include "compat.h"
+
+#if defined(ARCH_ARM64)
+#include <linux/elf.h>  /* NT_PRSTATUS */
+#endif
+
+#define STACK_TRACE_MAX_FRAMES 32
+
+/**
+ * Look up the address in /proc/<pid>/maps and format a short
+ * description ("pathname+offset") into @buf of size @buf_size.
+ * Returns @buf for convenience.
+ */
+static const char *maps_lookup(pid_t pid, unsigned long addr,
+				char *buf, size_t buf_size)
+{
+	char maps_path[64];
+	FILE *f;
+	unsigned long start, end;
+	char line[512];
+
+	snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int) pid);
+	f = fopen(maps_path, "r");
+	if (f == NULL) {
+		snprintf(buf, buf_size, "??");
+		return buf;
+	}
+
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char perms[8];
+		unsigned long offset;
+		unsigned int dev_maj, dev_min;
+		unsigned long inode;
+		char pathname[256];
+		int n;
+
+		n = sscanf(line, "%lx-%lx %7s %lx %x:%x %lu %255s",
+			&start, &end, perms, &offset,
+			&dev_maj, &dev_min, &inode, pathname);
+
+		if (n < 7)
+			continue;
+
+		if (addr >= start && addr < end) {
+			const char *name = (n >= 8) ? pathname : "[anonymous]";
+			snprintf(buf, buf_size, "%s+0x%lx",
+				name, addr - start + offset);
+			fclose(f);
+			return buf;
+		}
+	}
+
+	fclose(f);
+	snprintf(buf, buf_size, "??");
+	return buf;
+}
+
+/**
+ * Read a word from the tracee's memory at @address using ptrace.
+ * Returns 0 and sets @value on success, -1 on error.
+ */
+static int peek_tracee_word(pid_t pid, unsigned long address,
+			unsigned long *value)
+{
+	long result;
+
+	errno = 0;
+	result = ptrace(PTRACE_PEEKDATA, pid, (void *) address, NULL);
+	if (errno != 0)
+		return -1;
+
+	*value = (unsigned long) result;
+	return 0;
+}
+
+/**
+ * Print a stack trace for the given @tracee using its current register
+ * state (read via ptrace).  Only printed when verbose level >= 1.
+ * This should be called while the tracee is stopped (e.g., at
+ * PTRACE_EVENT_EXIT) so that its registers and memory are still
+ * accessible.
+ */
+static void print_stack_trace(Tracee *tracee)
+{
+	struct user_regs_struct regs;
+	unsigned long pc, sp, fp;
+	char info[512];
+	int frame;
+
+	if (tracee->verbose < 1)
+		return;
+
+#if defined(ARCH_ARM64)
+	{
+		struct iovec iov;
+		iov.iov_base = &regs;
+		iov.iov_len  = sizeof(regs);
+		if (ptrace(PTRACE_GETREGSET, tracee->pid,
+				(void *)(long) NT_PRSTATUS, &iov) < 0)
+			return;
+		pc = (unsigned long) regs.pc;
+		sp = (unsigned long) regs.sp;
+		fp = (unsigned long) regs.regs[29]; /* X29 */
+	}
+#else
+	if (ptrace(PTRACE_GETREGS, tracee->pid, NULL, &regs) < 0)
+		return;
+
+# if defined(ARCH_X86_64)
+	pc = (unsigned long) regs.rip;
+	sp = (unsigned long) regs.rsp;
+	fp = (unsigned long) regs.rbp;
+# elif defined(ARCH_X86)
+	pc = (unsigned long) regs.eip;
+	sp = (unsigned long) regs.esp;
+	fp = (unsigned long) regs.ebp;
+# elif defined(ARCH_ARM_EABI)
+	pc = (unsigned long) regs.uregs[15]; /* PC */
+	sp = (unsigned long) regs.uregs[13]; /* SP */
+	fp = (unsigned long) regs.uregs[11]; /* R11/FP */
+# elif defined(ARCH_SH4)
+	pc = (unsigned long) regs.pc;
+	sp = (unsigned long) regs.regs[15];
+	fp = 0; /* SH4 has no dedicated frame pointer */
+# else
+	(void) regs;
+	return;
+# endif
+#endif
+
+	(void) sp;
+
+	VERBOSE(tracee, 1, "vpid %" PRIu64 ": stack trace:", tracee->vpid);
+
+	/* Frame 0: the instruction pointer at the time of the fault.  */
+	VERBOSE(tracee, 1, "vpid %" PRIu64 ":  #%-2d 0x%0*lx  %s",
+		tracee->vpid, 0,
+		(int)(2 * sizeof(unsigned long)), pc,
+		maps_lookup(tracee->pid, pc, info, sizeof(info)));
+
+	/* Walk the frame-pointer chain to collect return addresses.  */
+	for (frame = 1; frame < STACK_TRACE_MAX_FRAMES && fp != 0; frame++) {
+		unsigned long ret_addr = 0;
+		unsigned long prev_fp  = 0;
+		int word_size;
+
+#if defined(ARCH_X86_64) || defined(ARCH_ARM64)
+		word_size = 8;
+#else
+		word_size = 4;
+#endif
+
+#if defined(ARCH_ARM_EABI)
+		/* On ARM EABI the saved PC is at [FP-4] and the
+		 * previous FP is at [FP-8].  */
+		if (peek_tracee_word(tracee->pid, fp - 4, &ret_addr) < 0)
+			break;
+		if (peek_tracee_word(tracee->pid, fp - 8, &prev_fp) < 0)
+			break;
+#else
+		/* On x86/x86_64/ARM64 the layout is:
+		 *   [FP+0]          = previous FP
+		 *   [FP+word_size]  = return address   */
+		if (peek_tracee_word(tracee->pid, fp, &prev_fp) < 0)
+			break;
+		if (peek_tracee_word(tracee->pid,
+				fp + (unsigned long) word_size,
+				&ret_addr) < 0)
+			break;
+#endif
+
+		if (ret_addr == 0)
+			break;
+
+		VERBOSE(tracee, 1, "vpid %" PRIu64 ":  #%-2d 0x%0*lx  %s",
+			tracee->vpid, frame,
+			(int)(2 * sizeof(unsigned long)), ret_addr,
+			maps_lookup(tracee->pid, ret_addr, info, sizeof(info)));
+
+		/* Sanity check: FP must advance (stack grows downward,
+		 * so the previous FP must be >= current FP on most
+		 * architectures) and be reasonably aligned.  */
+		if (prev_fp == 0 || prev_fp == fp)
+			break;
+		if (prev_fp < fp)
+			break;
+		if (prev_fp % sizeof(unsigned long) != 0)
+			break;
+
+		fp = prev_fp;
+	}
+}
 
 
 /**
@@ -585,9 +777,18 @@ static int handle_tracee_event_kernel_4_8(Tracee *tracee, int tracee_status)
 
 		case SIGTRAP | PTRACE_EVENT_VFORK_DONE << 8:
 		case SIGTRAP | PTRACE_EVENT_EXEC  << 8:
-		case SIGTRAP | PTRACE_EVENT_EXIT  << 8:
 			signal = 0;
 			break;
+
+		case SIGTRAP | PTRACE_EVENT_EXIT  << 8: {
+			unsigned long pending_status = 0;
+			signal = 0;
+			if (ptrace(PTRACE_GETEVENTMSG, tracee->pid, NULL,
+					&pending_status) == 0 &&
+			    WIFSIGNALED((int) pending_status))
+				print_stack_trace(tracee);
+			break;
+		}
 
 		case SIGSTOP:
 			/* Stop this tracee until PRoot has received
@@ -818,9 +1019,18 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 
 		case SIGTRAP | PTRACE_EVENT_VFORK_DONE << 8:
 		case SIGTRAP | PTRACE_EVENT_EXEC  << 8:
-		case SIGTRAP | PTRACE_EVENT_EXIT  << 8:
 			signal = 0;
 			break;
+
+		case SIGTRAP | PTRACE_EVENT_EXIT  << 8: {
+			unsigned long pending_status = 0;
+			signal = 0;
+			if (ptrace(PTRACE_GETEVENTMSG, tracee->pid, NULL,
+					&pending_status) == 0 &&
+			    WIFSIGNALED((int) pending_status))
+				print_stack_trace(tracee);
+			break;
+		}
 
 		case SIGSTOP:
 			/* Stop this tracee until PRoot has received
